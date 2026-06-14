@@ -1,0 +1,32 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Lumina <lumina@reaclisna.local>
+Date: Sun, 14 Jun 2026 06:20:00 +0000
+Subject: [PATCH] zc-328: force USB OTG to host mode
+
+The ZC-328 OTG port is wired to the dwc2 OTG controller but was left
+in the default "disabled" / "otg" state. Force it to host mode so
+that USB devices enumerate without relying on an ID pin detect.
+
+---
+ arch/arm/boot/dts/rockchip/rk3288-evb-rk808.dts | 5 +++++
+ 1 file changed, 5 insertions(+)
+
+diff --git a/arch/arm/boot/dts/rockchip/rk3288-evb-rk808.dts b/arch/arm/boot/dts/rockchip/rk3288-evb-rk808.dts
+index 670bb28e1..123456789 100644
+--- a/arch/arm/boot/dts/rockchip/rk3288-evb-rk808.dts
++++ b/arch/arm/boot/dts/rockchip/rk3288-evb-rk808.dts
+@@ -254,6 +254,11 @@
+ &usb_host1 {
+ 	status = "okay";
+ };
++
++&usb_otg {
++	dr_mode = "host";
++	status = "okay";
++};
+ 
+ &vopb {
+ 	status = "okay";
+ };
+-- 
+2.40.0
