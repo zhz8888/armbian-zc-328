@@ -1,0 +1,247 @@
+name: CI
+
+# 手动触发：构建 Armbian ZC-328 镜像。
+# 当前适配 Armbian tag：v26.11.0-trunk.30。
+# 编译产物（压缩镜像 + 校验和 + deb 软件包）以 release 形式发布。
+# release 名称格式：CI <armbian tag> <编译日期(UTC+0, 触发时刻)>
+on:
+  workflow_dispatch:
+    inputs:
+      upload_release:
+        description: 'Upload artifacts to a GitHub release'
+        type: boolean
+        default: true
+
+concurrency:
+  group: armbian-zc328-build
+  cancel-in-progress: false
+
+permissions:
+  contents: write
+
+env:
+  ARMBIAN_TAG: v26.11.0-trunk.30
+  # 镜像压缩率设为最大：xz 压缩比率最高档（0-9，9 为最大压缩率）
+  IMAGE_XZ_COMPRESSION_RATIO: 9
+
+jobs:
+  # ---------------------------------------------------------------------------
+  # prepare: 按触发时刻 UTC 生成 release 名
+  # ---------------------------------------------------------------------------
+  prepare:
+    name: Prepare
+    runs-on: ubuntu-latest
+    outputs:
+      release_name: ${{ steps.release-name.outputs.release_name }}
+    steps:
+      - name: Compute release name (CI <tag> <build date UTC, trigger time>)
+        id: release-name
+        run: |
+          set -euo pipefail
+          TAG="${{ env.ARMBIAN_TAG }}"
+          # 触发时刻 UTC 日期（构建可能跨天，以启动时刻为准保持一致）
+          DATE="$(date -u +%Y%m%d)"
+          echo "release_name=CI ${TAG} ${DATE}" >> "$GITHUB_OUTPUT"
+          echo "Release name: CI ${TAG} ${DATE}"
+
+  # ---------------------------------------------------------------------------
+  # build-debs: 构建板级 kernel/DTB/U-Boot debs，供 build job 复用
+  # ---------------------------------------------------------------------------
+  build-debs:
+    name: Build debs current
+    needs: prepare
+    runs-on: ubuntu-latest
+    timeout-minutes: 600
+    steps:
+      - name: Checkout this repo (board patches)
+        uses: actions/checkout@v4
+
+      - name: Checkout Armbian build repo at fixed tag
+        run: |
+          set -euo pipefail
+          cd "$GITHUB_WORKSPACE"
+          git clone --depth 1 --branch "${{ env.ARMBIAN_TAG }}" https://github.com/armbian/build.git armbian
+          test -f armbian/compile.sh
+
+      - name: Apply this repo's patches into Armbian build tree
+        run: |
+          set -euo pipefail
+          PROJ="$GITHUB_WORKSPACE"
+          BUILD="$GITHUB_WORKSPACE/armbian"
+          mkdir -p "$BUILD/config/boards" "$BUILD/config/kernel" "$BUILD/config/sources/families" \
+                   "$BUILD/userpatches/kernel/archive/rockchip-6.18" "$BUILD/userpatches/u-boot/v2026.04"
+          cp "$PROJ/config/boards/zc-328.conf"                          "$BUILD/config/boards/"
+          cp "$PROJ/config/kernel/linux-rockchip-current.config"        "$BUILD/config/kernel/"
+          cp "$PROJ/config/kernel/linux-rockchip-current.config.defconfig" "$BUILD/config/kernel/"
+          cp "$PROJ/config/sources/families/rockchip.conf"              "$BUILD/config/sources/families/"
+          cp "$PROJ"/userpatches/kernel/archive/rockchip-6.18/*.patch   "$BUILD/userpatches/kernel/archive/rockchip-6.18/"
+          cp "$PROJ"/userpatches/u-boot/v2026.04/*.patch                "$BUILD/userpatches/u-boot/v2026.04/"
+          # 保证 LF 行尾（Windows 检出可能是 CRLF）
+          find "$BUILD/config" "$BUILD/userpatches" \
+            \( -name '*.conf' -o -name '*.patch' -o -name '*.defconfig' \) \
+            -exec sed -i 's/\r$//' {} \;
+          # sanity: zc-328 块必须存在于 rockchip.conf
+          grep -q 'BOARD" == "zc-328"' "$BUILD/config/sources/families/rockchip.conf"
+
+      - name: Build kernel debs (inside Armbian docker)
+        run: |
+          set -euo pipefail
+          cd "$GITHUB_WORKSPACE/armbian"
+          # GITHUB_ACTIONS=false 避免框架因 CI 环境改变远程缓存行为
+          GITHUB_ACTIONS=false ./compile.sh docker \
+            BOARD=zc-328 \
+            BRANCH=current \
+            KERNEL_CONFIGURE=no \
+            KERNEL_GIT=shallow \
+            RELEASE=noble \
+            PREFER_DOCKER=no
+          sudo chown $(id -u):$(id -g) -R output/ || true
+
+      - name: Upload debs artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: debs-current
+          path: |
+            output/debs/*
+          if-no-files-found: error
+
+  # ---------------------------------------------------------------------------
+  # build: 完整镜像（按 README 基线参数），产物 + deb 上传 release
+  # ---------------------------------------------------------------------------
+  build:
+    name: Build image (noble/current)
+    needs: [ prepare, build-debs ]
+    runs-on: ubuntu-latest
+    timeout-minutes: 600
+    steps:
+      - name: Checkout this repo (board patches)
+        uses: actions/checkout@v4
+
+      - name: Checkout Armbian build repo at fixed tag
+        run: |
+          set -euo pipefail
+          cd "$GITHUB_WORKSPACE"
+          git clone --depth 1 --branch "${{ env.ARMBIAN_TAG }}" https://github.com/armbian/build.git armbian
+          test -f armbian/compile.sh
+
+      - name: Apply this repo's patches into Armbian build tree
+        run: |
+          set -euo pipefail
+          PROJ="$GITHUB_WORKSPACE"
+          BUILD="$GITHUB_WORKSPACE/armbian"
+          mkdir -p "$BUILD/config/boards" "$BUILD/config/kernel" "$BUILD/config/sources/families" \
+                   "$BUILD/userpatches/kernel/archive/rockchip-6.18" "$BUILD/userpatches/u-boot/v2026.04"
+          cp "$PROJ/config/boards/zc-328.conf"                          "$BUILD/config/boards/"
+          cp "$PROJ/config/kernel/linux-rockchip-current.config"        "$BUILD/config/kernel/"
+          cp "$PROJ/config/kernel/linux-rockchip-current.config.defconfig" "$BUILD/config/kernel/"
+          cp "$PROJ/config/sources/families/rockchip.conf"              "$BUILD/config/sources/families/"
+          cp "$PROJ"/userpatches/kernel/archive/rockchip-6.18/*.patch   "$BUILD/userpatches/kernel/archive/rockchip-6.18/"
+          cp "$PROJ"/userpatches/u-boot/v2026.04/*.patch                "$BUILD/userpatches/u-boot/v2026.04/"
+          # 保证 LF 行尾（Windows 检出可能是 CRLF）
+          find "$BUILD/config" "$BUILD/userpatches" \
+            \( -name '*.conf' -o -name '*.patch' -o -name '*.defconfig' \) \
+            -exec sed -i 's/\r$//' {} \;
+          # sanity: zc-328 块必须存在于 rockchip.conf
+          grep -q 'BOARD" == "zc-328"' "$BUILD/config/sources/families/rockchip.conf"
+
+      - name: Download debs
+        uses: actions/download-artifact@v4
+        with:
+          name: debs-current
+          path: armbian/output/debs/
+
+      - name: Build image (inside Armbian docker)
+        run: |
+          set -euo pipefail
+          cd "$GITHUB_WORKSPACE/armbian"
+          # README 基线参数（BOARD=zc-328 / BRANCH=current / RELEASE=noble / 无桌面 / 非 minimal）
+          GITHUB_ACTIONS=false ./compile.sh docker \
+            BOARD=zc-328 \
+            BRANCH=current \
+            BUILD_DESKTOP=no \
+            BUILD_MINIMAL=no \
+            KERNEL_CONFIGURE=no \
+            KERNEL_GIT=shallow \
+            RELEASE=noble \
+            COMPRESS_OUTPUTIMAGE=xz,sha \
+            PREFER_DOCKER=no
+          sudo chown $(id -u):$(id -g) -R output/ || true
+
+      - name: Collect artifacts
+        id: artifacts
+        run: |
+          set -euo pipefail
+          IMGDIR="$GITHUB_WORKSPACE/armbian/output/images"
+          ls -la "$IMGDIR"
+          # 压缩后产物为 .img.xz（失败时回退未压缩 .img）
+          IMG="$(ls "$IMGDIR"/*.img.xz 2>/dev/null | head -1)"
+          [[ -n "$IMG" ]] || IMG="$(ls "$IMGDIR"/*.img 2>/dev/null | head -1)"
+          [[ -n "$IMG" ]] || { echo "No image found in $IMGDIR"; exit 1; }
+          echo "img=$(basename "$IMG")" >> "$GITHUB_OUTPUT"
+
+      - name: Upload artifacts
+        uses: actions/upload-artifact@v4
+        with:
+          name: image-current
+          path: armbian/output/images/*
+
+      - name: Generate release notes
+        run: |
+          set -euo pipefail
+          TAG="${{ env.ARMBIAN_TAG }}"
+          DATE="$(date -u +'%Y-%m-%d %H:%M:%S') UTC"
+
+          ROOT="$GITHUB_WORKSPACE/armbian/output"
+          # 收集文件到表格行（文件名 + 人类可读大小）
+          rows=""
+          for f in "$ROOT"/images/*.img* "$ROOT"/debs/*.deb; do
+            [[ -f "$f" ]] || continue
+            name="$(basename "$f")"
+            bytes="$(stat -c %s "$f")"
+            if   (( bytes >= 1073741824 )); then size="$(awk "BEGIN{printf \"%.1f GiB\", $bytes/1073741824}")"
+            elif (( bytes >= 1048576 ));     then size="$(awk "BEGIN{printf \"%.1f MiB\", $bytes/1048576}")"
+            else                                  size="$(awk "BEGIN{printf \"%.1f KiB\", $bytes/1024}")"
+            fi
+            rows+="| ${name} | ${size} |"$'\n'
+          done
+
+          cat > "$GITHUB_WORKSPACE/release-notes.md" <<EOF
+          ## ZC-328 Armbian 镜像
+
+          - **Armbian tag**: ${TAG}
+          - **编译时间**: ${DATE}
+          - **Board**: ZC-328 (Rockchip RK3288)
+          - **Branch**: current
+          - **Release**: noble (Ubuntu 24.04 LTS)
+          - **压缩**: xz（IMAGE_XZ_COMPRESSION_RATIO=9）
+
+          ## 镜像文件
+
+          | 文件 | 大小 |
+          | --- | --- |
+          ${rows}
+          
+          ## 默认登录账号
+
+          Armbian 镜像默认凭据：
+
+          - **用户名**: root
+          - **密码**: 1234
+
+          > 首次登录会强制要求设置新密码。建议同时创建普通用户并 apt-mark hold 板级内核/U-Boot 包，避免升级被普通源覆盖（详见仓库 README）。
+          EOF
+
+      - name: Upload to release
+        if: ${{ inputs.upload_release }}
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: ${{ needs.prepare.outputs.release_name }}
+          name: ${{ needs.prepare.outputs.release_name }}
+          body_path: ${{ github.workspace }}/release-notes.md
+          files: |
+            armbian/output/images/*.img.xz
+            armbian/output/images/*.img
+            armbian/output/images/*.sha256*
+            armbian/output/debs/*.deb
+          fail_on_unmatched_files: false
+          generate_release_notes: false
