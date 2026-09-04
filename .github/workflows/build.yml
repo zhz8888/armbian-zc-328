@@ -90,9 +90,12 @@ jobs:
           # GITHUB_ACTIONS=false 避免框架因 CI 环境改变远程缓存行为
           # 用 'build' 而非 'docker' 子命令：armbian-next 在 GitHub runner 上会自动
           # 检测 Docker 并容器化构建；显式 'docker' 子命令在容器内会报 "asking for docker inside docker"。
+          # BUILD_DESKTOP/BUILD_MINIMAL 必须显式给定，否则非 TTY 环境会尝试 dialog 交互询问镜像类型而失败。
           GITHUB_ACTIONS=false ./compile.sh build \
             BOARD=zc-328 \
             BRANCH=current \
+            BUILD_DESKTOP=no \
+            BUILD_MINIMAL=no \
             KERNEL_CONFIGURE=no \
             KERNEL_GIT=shallow \
             RELEASE=noble
