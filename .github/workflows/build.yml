@@ -33,16 +33,20 @@ jobs:
     runs-on: ubuntu-latest
     outputs:
       release_name: ${{ steps.release-name.outputs.release_name }}
+      release_tag: ${{ steps.release-name.outputs.release_tag }}
     steps:
-      - name: Compute release name (CI <tag> <build date UTC, trigger time>)
+      - name: Compute release name/tag (CI <tag> <build date UTC, trigger time>)
         id: release-name
         run: |
           set -euo pipefail
           TAG="${{ env.ARMBIAN_TAG }}"
           # 触发时刻 UTC 日期（构建可能跨天，以启动时刻为准保持一致）
           DATE="$(date -u +%Y%m%d)"
+          # release 显示名可含空格（用户格式要求）；git tag 不允许空格，故派生一个无空格的 tag
           echo "release_name=CI ${TAG} ${DATE}" >> "$GITHUB_OUTPUT"
+          echo "release_tag=CI-${TAG}-${DATE}" >> "$GITHUB_OUTPUT"
           echo "Release name: CI ${TAG} ${DATE}"
+          echo "Release tag:  CI-${TAG}-${DATE}"
 
   # ---------------------------------------------------------------------------
   # build-debs: 构建板级 kernel/DTB/U-Boot debs，供 build job 复用
@@ -54,7 +58,7 @@ jobs:
     timeout-minutes: 600
     steps:
       - name: Checkout this repo (board patches)
-        uses: actions/checkout@v4
+        uses: actions/checkout@v7
 
       - name: Checkout Armbian build repo at fixed tag
         run: |
@@ -69,6 +73,7 @@ jobs:
           PROJ="$GITHUB_WORKSPACE"
           BUILD="$GITHUB_WORKSPACE/armbian"
           mkdir -p "$BUILD/config/boards" "$BUILD/config/kernel" "$BUILD/config/sources/families" \
+                   "$BUILD/userpatches/extensions" \
                    "$BUILD/userpatches/kernel/archive/rockchip-6.18" "$BUILD/userpatches/u-boot/v2026.04"
           cp "$PROJ/config/boards/zc-328.conf"                          "$BUILD/config/boards/"
           cp "$PROJ/config/kernel/linux-rockchip-current.config"        "$BUILD/config/kernel/"
@@ -100,7 +105,7 @@ jobs:
           sudo chown $(id -u):$(id -g) -R output/ || true
 
       - name: Upload debs artifact
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@v7
         with:
           name: debs-current
           path: |
@@ -110,9 +115,9 @@ jobs:
 
       - name: Upload debs to release
         if: ${{ inputs.upload_release }}
-        uses: softprops/action-gh-release@v2
+        uses: softprops/action-gh-release@v3
         with:
-          tag_name: ${{ needs.prepare.outputs.release_name }}
+          tag_name: ${{ needs.prepare.outputs.release_tag }}
           name: ${{ needs.prepare.outputs.release_name }}
           files: |
             armbian/output/debs/*.deb
@@ -130,7 +135,7 @@ jobs:
     timeout-minutes: 600
     steps:
       - name: Checkout this repo (board patches)
-        uses: actions/checkout@v4
+        uses: actions/checkout@v7
 
       - name: Checkout Armbian build repo at fixed tag
         run: |
@@ -145,6 +150,7 @@ jobs:
           PROJ="$GITHUB_WORKSPACE"
           BUILD="$GITHUB_WORKSPACE/armbian"
           mkdir -p "$BUILD/config/boards" "$BUILD/config/kernel" "$BUILD/config/sources/families" \
+                   "$BUILD/userpatches/extensions" \
                    "$BUILD/userpatches/kernel/archive/rockchip-6.18" "$BUILD/userpatches/u-boot/v2026.04"
           cp "$PROJ/config/boards/zc-328.conf"                          "$BUILD/config/boards/"
           cp "$PROJ/config/kernel/linux-rockchip-current.config"        "$BUILD/config/kernel/"
@@ -166,7 +172,7 @@ jobs:
         uses: docker/setup-qemu-action@v3
 
       - name: Download debs
-        uses: actions/download-artifact@v4
+        uses: actions/download-artifact@v8
         with:
           name: debs-current
           path: armbian/output/debs/
@@ -202,13 +208,13 @@ jobs:
           echo "img=$(basename "$IMG")" >> "$GITHUB_OUTPUT"
 
       - name: Upload image artifacts
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@v7
         with:
           name: image-current
           path: armbian/output/images/*
 
       - name: Upload debs artifacts
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@v7
         with:
           name: debs-all
           path: |
@@ -265,9 +271,9 @@ jobs:
 
       - name: Upload to release
         if: ${{ inputs.upload_release }}
-        uses: softprops/action-gh-release@v2
+        uses: softprops/action-gh-release@v3
         with:
-          tag_name: ${{ needs.prepare.outputs.release_name }}
+          tag_name: ${{ needs.prepare.outputs.release_tag }}
           name: ${{ needs.prepare.outputs.release_name }}
           body_path: ${{ github.workspace }}/release-notes.md
           files: |
