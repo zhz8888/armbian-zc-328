@@ -104,8 +104,21 @@ jobs:
         with:
           name: debs-current
           path: |
-            output/debs/*
+            armbian/output/debs/*.deb
+            armbian/output/debs/**/*.deb
           if-no-files-found: error
+
+      - name: Upload debs to release
+        if: ${{ inputs.upload_release }}
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: ${{ needs.prepare.outputs.release_name }}
+          name: ${{ needs.prepare.outputs.release_name }}
+          files: |
+            armbian/output/debs/*.deb
+            armbian/output/debs/**/*.deb
+          fail_on_unmatched_files: false
+          generate_release_notes: false
 
   # ---------------------------------------------------------------------------
   # build: 完整镜像（按 README 基线参数），产物 + deb 上传 release
@@ -188,11 +201,20 @@ jobs:
           [[ -n "$IMG" ]] || { echo "No image found in $IMGDIR"; exit 1; }
           echo "img=$(basename "$IMG")" >> "$GITHUB_OUTPUT"
 
-      - name: Upload artifacts
+      - name: Upload image artifacts
         uses: actions/upload-artifact@v4
         with:
           name: image-current
           path: armbian/output/images/*
+
+      - name: Upload debs artifacts
+        uses: actions/upload-artifact@v4
+        with:
+          name: debs-all
+          path: |
+            armbian/output/debs/*.deb
+            armbian/output/debs/**/*.deb
+          if-no-files-found: warn
 
       - name: Generate release notes
         run: |
@@ -201,9 +223,10 @@ jobs:
           DATE="$(date -u +'%Y-%m-%d %H:%M:%S') UTC"
 
           ROOT="$GITHUB_WORKSPACE/armbian/output"
-          # 收集文件到表格行（文件名 + 人类可读大小）
+          # 收集文件到表格行（文件名 + 人类可读大小），debs 递归含 extra/ 子目录
           rows=""
-          for f in "$ROOT"/images/*.img* "$ROOT"/debs/*.deb; do
+          # shellcheck disable=SC2044
+          for f in "$ROOT"/images/*.img* $(find "$ROOT"/debs -name '*.deb' 2>/dev/null); do
             [[ -f "$f" ]] || continue
             name="$(basename "$f")"
             bytes="$(stat -c %s "$f")"
@@ -252,5 +275,6 @@ jobs:
             armbian/output/images/*.img
             armbian/output/images/*.sha256*
             armbian/output/debs/*.deb
+            armbian/output/debs/**/*.deb
           fail_on_unmatched_files: false
           generate_release_notes: false
