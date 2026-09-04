@@ -88,14 +88,12 @@ jobs:
           set -euo pipefail
           cd "$GITHUB_WORKSPACE/armbian"
           # GITHUB_ACTIONS=false 避免框架因 CI 环境改变远程缓存行为
-          # 用 'build' 而非 'docker' 子命令：armbian-next 在 GitHub runner 上会自动
-          # 检测 Docker 并容器化构建；显式 'docker' 子命令在容器内会报 "asking for docker inside docker"。
-          # BUILD_DESKTOP/BUILD_MINIMAL 必须显式给定，否则非 TTY 环境会尝试 dialog 交互询问镜像类型而失败。
-          GITHUB_ACTIONS=false ./compile.sh build \
+          # 用 'kernel' artifact 命令编 debs：kernel 是交叉编译，无需 binfmt/chroot，
+          # 也不走镜像构建的交互式 desktop/minimal 询问。'build' 会触发 NEEDS_BINFMT
+          # （armhf rootfs 需 qemu binfmt），在未预配 binfmt 的 runner 上会失败。
+          GITHUB_ACTIONS=false ./compile.sh kernel \
             BOARD=zc-328 \
             BRANCH=current \
-            BUILD_DESKTOP=no \
-            BUILD_MINIMAL=no \
             KERNEL_CONFIGURE=no \
             KERNEL_GIT=shallow \
             RELEASE=noble
@@ -147,6 +145,12 @@ jobs:
             -exec sed -i 's/\r$//' {} \;
           # sanity: zc-328 块必须存在于 rockchip.conf
           grep -q 'BOARD" == "zc-328"' "$BUILD/config/sources/families/rockchip.conf"
+
+      # rk3288 是 armhf，镜像构建需在 chroot 里跑 armhf 二进制，依赖宿主 qemu binfmt。
+      # setup-qemu-action 在 runner 宿主注册 binfmt_misc，armbian 容器（共享宿主内核）内才能通过
+      # update-binfmts/arch-test 检查。
+      - name: Set up QEMU (armhf binfmt for runner host)
+        uses: docker/setup-qemu-action@v3
 
       - name: Download debs
         uses: actions/download-artifact@v4
