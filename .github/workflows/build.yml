@@ -44,16 +44,19 @@ jobs:
           DATE="$(date -u +%Y%m%d)"
           # release 显示名可含空格（用户格式要求）；git tag 不允许空格，故派生一个无空格的 tag
           echo "release_name=CI ${TAG} ${DATE}" >> "$GITHUB_OUTPUT"
-          echo "release_tag=CI-${TAG}-${DATE}" >> "$GITHUB_OUTPUT"
+          # 追加 run 序号保证每次触发 tag 唯一：同一天重复触发会复用同一日期，
+          # 若 tag 相同 softprops 会更新既有 release 并先删除同名旧资产，而刚上传的资产
+          # 在 GitHub API 里删除常返回 404（最终一致性），导致上传步骤失败。
+          # 每次 run 用全新 tag => 总是创建新 release，不覆盖旧资产，彻底规避该问题。
+          echo "release_tag=CI-${TAG}-${DATE}-r${{ github.run_number }}" >> "$GITHUB_OUTPUT"
           echo "Release name: CI ${TAG} ${DATE}"
-          echo "Release tag:  CI-${TAG}-${DATE}"
+          echo "Release tag:  CI-${TAG}-${DATE}-r${{ github.run_number }}"
 
   # ---------------------------------------------------------------------------
   # build-debs: 构建板级 kernel/DTB/U-Boot debs，供 build job 复用
   # ---------------------------------------------------------------------------
   build-debs:
     name: Build debs current
-    needs: prepare
     runs-on: ubuntu-latest
     timeout-minutes: 600
     steps:
@@ -113,18 +116,6 @@ jobs:
             armbian/output/debs/**/*.deb
           if-no-files-found: error
 
-      - name: Upload debs to release
-        if: ${{ inputs.upload_release }}
-        uses: softprops/action-gh-release@v3
-        with:
-          tag_name: ${{ needs.prepare.outputs.release_tag }}
-          name: ${{ needs.prepare.outputs.release_name }}
-          files: |
-            armbian/output/debs/*.deb
-            armbian/output/debs/**/*.deb
-          fail_on_unmatched_files: false
-          generate_release_notes: false
-
   # ---------------------------------------------------------------------------
   # build: 完整镜像（按 README 基线参数），产物 + deb 上传 release
   # ---------------------------------------------------------------------------
@@ -169,7 +160,7 @@ jobs:
       # setup-qemu-action 在 runner 宿主注册 binfmt_misc，armbian 容器（共享宿主内核）内才能通过
       # update-binfmts/arch-test 检查。
       - name: Set up QEMU (armhf binfmt for runner host)
-        uses: docker/setup-qemu-action@v3
+        uses: docker/setup-qemu-action@v4
 
       - name: Download debs
         uses: actions/download-artifact@v8
