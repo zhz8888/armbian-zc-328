@@ -2,7 +2,8 @@ name: CI
 
 # 手动触发：构建 Armbian ZC-328 镜像。
 # 当前适配 Armbian tag：v26.11.0-trunk.30。
-# 编译产物（压缩镜像 + 校验和 + deb 软件包）以 release 形式发布。
+# 编译产物（压缩镜像 + 校验和 + build-debs 构建的板级 deb）以 release 形式发布；
+# 镜像构建 job 不再重复上传 deb（此前 deb 重复上传同名资产导致 release API 404）。
 # release 名称格式：CI <armbian tag> <编译日期(UTC+0, 触发时刻)>
 on:
   workflow_dispatch:
@@ -59,6 +60,7 @@ jobs:
     name: Build debs current
     runs-on: ubuntu-latest
     timeout-minutes: 600
+    needs: [ prepare ]
     steps:
       - name: Checkout this repo (board patches)
         uses: actions/checkout@v7
@@ -116,8 +118,33 @@ jobs:
             armbian/output/debs/**/*.deb
           if-no-files-found: error
 
+      # 板级 deb 挂到 release：本 job 先于 build job 结束，负责创建 release 并附带 deb，
+      # build job 稍后向同一 release 追加镜像并更新 body。
+      - name: Stage debs for release
+        if: ${{ inputs.upload_release }}
+        run: |
+          set -euo pipefail
+          mkdir -p armbian/output/debs-release
+          # 展平到单一目录，仅用一个不含 ** 的通配符上传，避免同名资产重复上传触发 404
+          find armbian/output/debs -name '*.deb' -exec cp {} armbian/output/debs-release/ \;
+          ls -la armbian/output/debs-release/
+
+      - name: Upload debs to release
+        if: ${{ inputs.upload_release }}
+        uses: softprops/action-gh-release@v3
+        with:
+          tag_name: ${{ needs.prepare.outputs.release_tag }}
+          name: ${{ needs.prepare.outputs.release_name }}
+          body: |
+            ZC-328 板级 deb 软件包（内核 / DTB / U-Boot / headers）。
+            完整镜像（.img.xz + sha256）由 Build image job 稍后追加到本 release。
+          files: armbian/output/debs-release/*.deb
+          fail_on_unmatched_files: true
+          generate_release_notes: false
+
   # ---------------------------------------------------------------------------
-  # build: 完整镜像（按 README 基线参数），产物 + deb 上传 release
+  # build: 完整镜像（按 README 基线参数），仅镜像产物上传 release
+  # （板级 deb 已由 build-debs job 上传至 release，此处不再重复上传）
   # ---------------------------------------------------------------------------
   build:
     name: Build image (noble/current)
@@ -204,15 +231,6 @@ jobs:
           name: image-current
           path: armbian/output/images/*
 
-      - name: Upload debs artifacts
-        uses: actions/upload-artifact@v7
-        with:
-          name: debs-all
-          path: |
-            armbian/output/debs/*.deb
-            armbian/output/debs/**/*.deb
-          if-no-files-found: warn
-
       - name: Generate release notes
         run: |
           set -euo pipefail
@@ -220,10 +238,9 @@ jobs:
           DATE="$(date -u +'%Y-%m-%d %H:%M:%S') UTC"
 
           ROOT="$GITHUB_WORKSPACE/armbian/output"
-          # 收集文件到表格行（文件名 + 人类可读大小），debs 递归含 extra/ 子目录
+          # 收集镜像文件到表格行（文件名 + 人类可读大小）
           rows=""
-          # shellcheck disable=SC2044
-          for f in "$ROOT"/images/*.img* $(find "$ROOT"/debs -name '*.deb' 2>/dev/null); do
+          for f in "$ROOT"/images/*.img*; do
             [[ -f "$f" ]] || continue
             name="$(basename "$f")"
             bytes="$(stat -c %s "$f")"
@@ -243,6 +260,7 @@ jobs:
           - **Branch**: current
           - **Release**: noble (Ubuntu 24.04 LTS)
           - **压缩**: xz（IMAGE_XZ_COMPRESSION_RATIO=9）
+          - **deb 软件包**: 板级内核 / DTB / U-Boot / headers 包已随本 release 附带（由 Build debs job 上传）
 
           ## 镜像文件
 
@@ -267,11 +285,11 @@ jobs:
           tag_name: ${{ needs.prepare.outputs.release_tag }}
           name: ${{ needs.prepare.outputs.release_name }}
           body_path: ${{ github.workspace }}/release-notes.md
+          # 仅上传镜像与校验和；deb 包已由 build-debs job 上传，不再重复上传
+          # （此前 deb 的两个通配符重叠导致同名资产上传两次，release API 报 404 使 job 失败）
           files: |
             armbian/output/images/*.img.xz
             armbian/output/images/*.img
             armbian/output/images/*.sha256*
-            armbian/output/debs/*.deb
-            armbian/output/debs/**/*.deb
           fail_on_unmatched_files: false
           generate_release_notes: false
