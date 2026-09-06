@@ -59,11 +59,13 @@ jobs:
           echo "Release name: CI ${TAG} ${DATE}"
           echo "Release tag:  CI-${TAG}-${DATE}-r${{ github.run_number }}"
 
-      # gh release create 默认立即发布（非草稿），后续任务按 tag 查找可靠
+      # gh release create 默认立即发布（非草稿），后续任务按 tag 查找可靠。
+      # prepare 任务没有 checkout，gh 无法从 git remote 推断仓库，须显式指定 GH_REPO
       - name: Create release (description only)
         if: ${{ inputs.upload_release }}
         env:
           GH_TOKEN: ${{ github.token }}
+          GH_REPO: ${{ github.repository }}
         run: |
           set -euo pipefail
           cat > release-body.md <<'EOF'
@@ -161,6 +163,7 @@ jobs:
         if: ${{ inputs.upload_release }}
         env:
           GH_TOKEN: ${{ github.token }}
+          GH_REPO: ${{ github.repository }}
         run: |
           set -euo pipefail
           # 展平到单一目录再上传，避免 *.deb 与 **/*.deb 通配符重叠导致同名资产重复上传
@@ -297,6 +300,7 @@ jobs:
         if: ${{ inputs.upload_release }}
         env:
           GH_TOKEN: ${{ github.token }}
+          GH_REPO: ${{ github.repository }}
         run: |
           set -euo pipefail
           cd "$GITHUB_WORKSPACE/armbian/output/images"
