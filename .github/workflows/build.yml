@@ -2,8 +2,9 @@ name: CI
 
 # 手动触发：构建 Armbian ZC-328 镜像。
 # 当前适配 Armbian tag：v26.11.0-trunk.30。
-# 编译产物（压缩镜像 + 校验和 + build-debs 构建的板级 deb）以 release 形式发布；
-# 镜像构建 job 不再重复上传 deb（此前 deb 重复上传同名资产导致 release API 404）。
+# 编译产物以 release 形式发布：build-debs 构建的板级 deb + 各系统/类型变体的压缩镜像。
+# 矩阵风格参考 armbian-onecloud：多系统（RELEASE）× 多类型（minimal/cli/xfce 桌面）并行构建，
+# 各任务把自身产物与 sha256 追加到同一 release（append_body，prepare 预先建好 release）。
 # release 名称格式：CI <armbian tag> <编译日期(UTC+0, 触发时刻)>
 on:
   workflow_dispatch:
@@ -27,7 +28,8 @@ env:
 
 jobs:
   # ---------------------------------------------------------------------------
-  # prepare: 按触发时刻 UTC 生成 release 名
+  # prepare: 按触发时刻 UTC 生成 release 名并预先创建 release（静态说明 + SHA256 空节，
+  #          后续 build-debs / 各镜像矩阵任务只追加附件与校验和，不再覆盖 body）
   # ---------------------------------------------------------------------------
   prepare:
     name: Prepare
@@ -50,11 +52,43 @@ jobs:
           # 在 GitHub API 里删除常返回 404（最终一致性），导致上传步骤失败。
           # 每次 run 用全新 tag => 总是创建新 release，不覆盖旧资产，彻底规避该问题。
           echo "release_tag=CI-${TAG}-${DATE}-r${{ github.run_number }}" >> "$GITHUB_OUTPUT"
+          echo "release_date=$(date -u +'%Y-%m-%d %H:%M:%S') UTC" >> "$GITHUB_OUTPUT"
           echo "Release name: CI ${TAG} ${DATE}"
           echo "Release tag:  CI-${TAG}-${DATE}-r${{ github.run_number }}"
 
+      - name: Create release
+        if: ${{ inputs.upload_release }}
+        uses: softprops/action-gh-release@v3
+        with:
+          tag_name: ${{ steps.release-name.outputs.release_tag }}
+          target_commitish: ${{ github.sha }}
+          name: ${{ steps.release-name.outputs.release_name }}
+          generate_release_notes: false
+          body: |
+            ## ZC-328 Armbian 镜像
+
+            - **Armbian tag**: ${{ env.ARMBIAN_TAG }}
+            - **编译时间**: ${{ steps.release-name.outputs.release_date }}
+            - **Board**: ZC-328 (Rockchip RK3288)
+            - **Branch**: current
+            - **压缩**: xz（IMAGE_XZ_COMPRESSION_RATIO=9）
+            - **deb 软件包**: 板级内核 / DTB / headers 包已随本 release 附带（由 Build debs job 上传）
+            - **镜像变体**: 多系统 × 多类型（minimal / cli / xfce 桌面），清单见下方 SHA256 与附件
+
+            ## 默认登录账号
+
+            Armbian 镜像默认凭据：
+
+            - **用户名**: root
+            - **密码**: 1234
+
+            > 首次登录会强制要求设置新密码。建议同时创建普通用户并 apt-mark hold 板级内核/U-Boot 包，避免升级被普通源覆盖（详见仓库 README）。
+
+            ## SHA256
+
   # ---------------------------------------------------------------------------
-  # build-debs: 构建板级 kernel/DTB/U-Boot debs，供 build job 复用
+  # build-debs: 构建板级 kernel/DTB/headers debs（与目标系统无关，供所有镜像变体复用），
+  #             并作为附件挂到 prepare 创建的 release 上
   # ---------------------------------------------------------------------------
   build-debs:
     name: Build debs current
@@ -118,8 +152,6 @@ jobs:
             armbian/output/debs/**/*.deb
           if-no-files-found: error
 
-      # 板级 deb 挂到 release：本 job 先于 build job 结束，负责创建 release 并附带 deb，
-      # build job 稍后向同一 release 追加镜像并更新 body。
       - name: Stage debs for release
         if: ${{ inputs.upload_release }}
         run: |
@@ -129,28 +161,53 @@ jobs:
           find armbian/output/debs -name '*.deb' -exec cp {} armbian/output/debs-release/ \;
           ls -la armbian/output/debs-release/
 
+      # release 已由 prepare 创建，本步骤只追加 deb 附件（不改动 body）
       - name: Upload debs to release
         if: ${{ inputs.upload_release }}
         uses: softprops/action-gh-release@v3
         with:
           tag_name: ${{ needs.prepare.outputs.release_tag }}
-          name: ${{ needs.prepare.outputs.release_name }}
-          body: |
-            ZC-328 板级 deb 软件包（内核 / DTB / U-Boot / headers）。
-            完整镜像（.img.xz + sha256）由 Build image job 稍后追加到本 release。
           files: armbian/output/debs-release/*.deb
           fail_on_unmatched_files: true
           generate_release_notes: false
 
   # ---------------------------------------------------------------------------
-  # build: 完整镜像（按 README 基线参数），仅镜像产物上传 release
-  # （板级 deb 已由 build-debs job 上传至 release，此处不再重复上传）
+  # build: 镜像矩阵（RELEASE × TYPE），参考 armbian-onecloud：
+  #   minimal => BUILD_MINIMAL=yes；cli => 两者皆 no；desktop => BUILD_DESKTOP=yes + xfce
+  # 各变体镜像文件名天然不同（armbian 会在文件名附加 _minimal / _<桌面环境>），
+  # 并行构建，互不干扰；各自把镜像 + sha256 追加到 release。
   # ---------------------------------------------------------------------------
   build:
-    name: Build image (noble/current)
+    name: Build ${{ matrix.RELEASE }}-${{ matrix.TYPE == 'desktop' && matrix.DESKTOP_ENVIRONMENT || matrix.TYPE }}
     needs: [ prepare, build-debs ]
     runs-on: ubuntu-latest
     timeout-minutes: 600
+    strategy:
+      fail-fast: false
+      matrix:
+        RELEASE:
+          # 以下为 armbian v26.11 支持的发行版，按需取消注释
+          # - focal # Ubuntu 20.04 LTS（已 EOL）
+          # - jammy # Ubuntu 22.04 LTS
+          - noble # Ubuntu 24.04 LTS
+          # - questing # Ubuntu 25.10
+          - resolute # Ubuntu 26.04 LTS
+          # - buster # Debian 10
+          # - bullseye # Debian 11
+          - bookworm # Debian 12
+          - trixie # Debian 13
+          # - forky # Debian 14（testing）
+          # - sid # Debian unstable
+        TYPE:
+          - minimal
+          - cli
+          - desktop
+        include:
+          - TYPE: desktop
+            DESKTOP_ENVIRONMENT: xfce
+            DESKTOP_ENVIRONMENT_CONFIG_NAME: config_base
+            DESKTOP_APPGROUPS_SELECTED: ""
+
     steps:
       - name: Checkout this repo (board patches)
         uses: actions/checkout@v7
@@ -199,17 +256,21 @@ jobs:
         run: |
           set -euo pipefail
           cd "$GITHUB_WORKSPACE/armbian"
-          # README 基线参数（BOARD=zc-328 / BRANCH=current / RELEASE=noble / 无桌面 / 非 minimal）
           # 用 'build' 而非 'docker' 子命令：armbian-next 在 GitHub runner 上会自动
           # 检测 Docker 并容器化构建；显式 'docker' 子命令在容器内会报 "asking for docker inside docker"。
+          # minimal/cli/desktop 由矩阵 TYPE 决定；desktop 额外传 xfce 相关参数。
           GITHUB_ACTIONS=false ./compile.sh build \
             BOARD=zc-328 \
             BRANCH=current \
-            BUILD_DESKTOP=no \
-            BUILD_MINIMAL=no \
+            RELEASE=${{ matrix.RELEASE }} \
+            BUILD_MINIMAL=${{ matrix.TYPE == 'minimal' && 'yes' || 'no' }} \
+            BUILD_DESKTOP=${{ matrix.TYPE == 'desktop' && 'yes' || 'no' }} \
+            DESKTOP_ENVIRONMENT=${{ matrix.DESKTOP_ENVIRONMENT }} \
+            DESKTOP_ENVIRONMENT_CONFIG_NAME=${{ matrix.DESKTOP_ENVIRONMENT_CONFIG_NAME }} \
+            DESKTOP_APPGROUPS_SELECTED=${{ matrix.DESKTOP_APPGROUPS_SELECTED }} \
             KERNEL_CONFIGURE=no \
             KERNEL_GIT=shallow \
-            RELEASE=noble \
+            EXPERT=yes \
             COMPRESS_OUTPUTIMAGE=xz,sha
           sudo chown $(id -u):$(id -g) -R output/ || true
 
@@ -228,68 +289,34 @@ jobs:
       - name: Upload image artifacts
         uses: actions/upload-artifact@v7
         with:
-          name: image-current
+          name: image-${{ matrix.RELEASE }}-${{ matrix.TYPE == 'desktop' && matrix.DESKTOP_ENVIRONMENT || matrix.TYPE }}
           path: armbian/output/images/*
 
-      - name: Generate release notes
+      - name: Generate release addendum (sha256 lines)
         run: |
           set -euo pipefail
-          TAG="${{ env.ARMBIAN_TAG }}"
-          DATE="$(date -u +'%Y-%m-%d %H:%M:%S') UTC"
-
-          ROOT="$GITHUB_WORKSPACE/armbian/output"
-          # 收集镜像文件到表格行（文件名 + 人类可读大小）
-          rows=""
-          for f in "$ROOT"/images/*.img*; do
-            [[ -f "$f" ]] || continue
-            name="$(basename "$f")"
-            bytes="$(stat -c %s "$f")"
-            if   (( bytes >= 1073741824 )); then size="$(awk "BEGIN{printf \"%.1f GiB\", $bytes/1073741824}")"
-            elif (( bytes >= 1048576 ));     then size="$(awk "BEGIN{printf \"%.1f MiB\", $bytes/1048576}")"
-            else                                  size="$(awk "BEGIN{printf \"%.1f KiB\", $bytes/1024}")"
-            fi
-            rows+="| ${name} | ${size} |"$'\n'
-          done
-
-          cat > "$GITHUB_WORKSPACE/release-notes.md" <<EOF
-          ## ZC-328 Armbian 镜像
-
-          - **Armbian tag**: ${TAG}
-          - **编译时间**: ${DATE}
-          - **Board**: ZC-328 (Rockchip RK3288)
-          - **Branch**: current
-          - **Release**: noble (Ubuntu 24.04 LTS)
-          - **压缩**: xz（IMAGE_XZ_COMPRESSION_RATIO=9）
-          - **deb 软件包**: 板级内核 / DTB / U-Boot / headers 包已随本 release 附带（由 Build debs job 上传）
-
-          ## 镜像文件
-
-          | 文件 | 大小 |
-          | --- | --- |
-          ${rows}
-          
-          ## 默认登录账号
-
-          Armbian 镜像默认凭据：
-
-          - **用户名**: root
-          - **密码**: 1234
-
-          > 首次登录会强制要求设置新密码。建议同时创建普通用户并 apt-mark hold 板级内核/U-Boot 包，避免升级被普通源覆盖（详见仓库 README）。
-          EOF
+          cd "$GITHUB_WORKSPACE/armbian/output/images"
+          # armbian 在 COMPRESS_OUTPUTIMAGE=xz,sha 时生成 <镜像>.img.xz.sha（内容: <hash> <文件名>）；
+          # 旧工作流用 *.sha256* 通配符匹配不到该文件，release 里因此一直没有校验和文件
+          if ls *.img.xz.sha >/dev/null 2>&1; then
+            awk '{printf "%s: `%s`\n", $2, $1}' *.img.xz.sha > "$GITHUB_WORKSPACE/release-addendum.md"
+          else
+            sha256sum *.img.xz | awk '{printf "%s: `%s`\n", $2, $1}' > "$GITHUB_WORKSPACE/release-addendum.md"
+          fi
+          cat "$GITHUB_WORKSPACE/release-addendum.md"
 
       - name: Upload to release
         if: ${{ inputs.upload_release }}
         uses: softprops/action-gh-release@v3
         with:
           tag_name: ${{ needs.prepare.outputs.release_tag }}
-          name: ${{ needs.prepare.outputs.release_name }}
-          body_path: ${{ github.workspace }}/release-notes.md
-          # 仅上传镜像与校验和；deb 包已由 build-debs job 上传，不再重复上传
-          # （此前 deb 的两个通配符重叠导致同名资产上传两次，release API 报 404 使 job 失败）
+          # 各矩阵任务并行把自己的 sha256 行追加到 release 末尾（body 由 prepare 预置）
+          append_body: true
+          body_path: release-addendum.md
+          # 镜像 + 校验和；armbian 生成的是 <镜像>.img.xz.sha，须用 *.sha 才能匹配到
           files: |
             armbian/output/images/*.img.xz
             armbian/output/images/*.img
-            armbian/output/images/*.sha256*
+            armbian/output/images/*.sha
           fail_on_unmatched_files: false
           generate_release_notes: false
