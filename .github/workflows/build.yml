@@ -4,8 +4,10 @@ name: CI
 # 当前适配 Armbian tag：v26.11.0-trunk.30。
 # 编译产物以 release 形式发布：build-debs 构建的板级 deb + 各系统/类型变体的压缩镜像。
 # 矩阵风格参考 armbian-onecloud：多系统（RELEASE）× 多类型（minimal/cli/xfce 桌面）并行构建。
-# release 流程：prepare 用 gh 预先创建 release（body 仅纯描述信息，只写这一次），
-# build-debs / 各镜像任务用 `gh release upload --clobber` 只追加附件，不改写 body。
+# release 流程：prepare 只计算 release 名/tag；第一次上传附件的任务负责确保 release
+# 存在（不存在则用 .github/release-body.md 重建，body 为纯描述信息，重建后不再改写）。
+# 这样本就无附件的"空壳" release 不会提前暴露（易被误删），且运行期间 release 被删
+# 也能在第一次上传时自愈，不会让构建几十分钟的任务白白失败。
 # 不用 softprops：其 v3 先建草稿再发布，其他任务按 tag 查不到草稿会另建新 release，
 # 且其重复草稿清理逻辑会删掉带正文的那个 release，导致描述信息丢失。
 # release 名称格式：CI <armbian tag> <编译日期(UTC+0, 触发时刻)>
@@ -31,8 +33,8 @@ env:
 
 jobs:
   # ---------------------------------------------------------------------------
-  # prepare: 按触发时刻 UTC 生成 release 名，并立即创建 release（非草稿）。
-  #          body 只有纯描述信息；SHA256 与文件清单一律不再写入 release 正文。
+  # prepare: 按触发时刻 UTC 单点计算 release 名/tag（跨天时所有任务保持一致）。
+  #          不在此创建 release——空壳 release 暴露在外易被误删（r11 即被运行中删除）。
   # ---------------------------------------------------------------------------
   prepare:
     name: Prepare
@@ -55,47 +57,12 @@ jobs:
           # 在 GitHub API 里删除常返回 404（最终一致性），导致上传步骤失败。
           # 每次 run 用全新 tag => 总是创建新 release，不覆盖旧资产，彻底规避该问题。
           echo "release_tag=CI-${TAG}-${DATE}-r${{ github.run_number }}" >> "$GITHUB_OUTPUT"
-          echo "release_date=$(date -u +'%Y-%m-%d %H:%M:%S') UTC" >> "$GITHUB_OUTPUT"
           echo "Release name: CI ${TAG} ${DATE}"
           echo "Release tag:  CI-${TAG}-${DATE}-r${{ github.run_number }}"
 
-      # gh release create 默认立即发布（非草稿），后续任务按 tag 查找可靠。
-      # prepare 任务没有 checkout，gh 无法从 git remote 推断仓库，须显式指定 GH_REPO
-      - name: Create release (description only)
-        if: ${{ inputs.upload_release }}
-        env:
-          GH_TOKEN: ${{ github.token }}
-          GH_REPO: ${{ github.repository }}
-        run: |
-          set -euo pipefail
-          cat > release-body.md <<'EOF'
-          ## ZC-328 Armbian 镜像
-
-          - **Armbian tag**: ${{ env.ARMBIAN_TAG }}
-          - **编译时间**: ${{ steps.release-name.outputs.release_date }}
-          - **Board**: ZC-328 (Rockchip RK3288)
-          - **Branch**: current
-          - **压缩**: xz（IMAGE_XZ_COMPRESSION_RATIO=9）
-          - **系统变体**: noble / resolute / bookworm / trixie × minimal / cli / xfce 桌面
-          - **deb 软件包**: 板级内核 / DTB / headers 包已随本 release 附带
-
-          ## 默认登录账号
-
-          Armbian 镜像默认凭据：
-
-          - **用户名**: root
-          - **密码**: 1234
-
-          > 首次登录会强制要求设置新密码。建议同时创建普通用户并 apt-mark hold 板级内核/U-Boot 包，避免升级被普通源覆盖（详见仓库 README）。
-          EOF
-          gh release create "${{ steps.release-name.outputs.release_tag }}" \
-            --title "${{ steps.release-name.outputs.release_name }}" \
-            --notes-file release-body.md \
-            --target "$GITHUB_SHA"
-
   # ---------------------------------------------------------------------------
   # build-debs: 构建板级 kernel/DTB/headers debs（与目标系统无关，供所有镜像变体复用），
-  #             并作为附件追加到 prepare 创建的 release 上（不改写 body）
+  #             并作为附件追加到 release 上（不改写 body）
   # ---------------------------------------------------------------------------
   build-debs:
     name: Build debs current
@@ -172,7 +139,16 @@ jobs:
           shopt -s nullglob
           debs=(armbian/output/debs-release/*.deb)
           [[ ${#debs[@]} -gt 0 ]] || { echo "No debs to upload"; exit 1; }
-          # 只追加附件，不改写 release body
+          # 确保.release 存在（运行中被删则用仓库里的纯描述 body 重建），再只追加附件
+          ensure-release() {
+            gh release view "$1" >/dev/null 2>&1 && return 0
+            echo "Release $1 missing, re-creating from .github/release-body.md ..."
+            gh release create "$1" \
+              --title "${{ needs.prepare.outputs.release_name }}" \
+              --notes-file .github/release-body.md \
+              --target "$GITHUB_SHA"
+          }
+          ensure-release "${{ needs.prepare.outputs.release_tag }}"
           gh release upload "${{ needs.prepare.outputs.release_tag }}" --clobber "${debs[@]}"
 
   # ---------------------------------------------------------------------------
@@ -305,7 +281,18 @@ jobs:
           set -euo pipefail
           cd "$GITHUB_WORKSPACE/armbian/output/images"
           # 镜像 + 校验和；armbian 生成的是 <镜像>.img.xz.sha，须包含 *.sha 才能匹配到。
-          # 只追加附件，不改写 release body（正文由 prepare 写好，保持纯描述信息）
+          # 确保 release 存在（运行中被删则重建，同 build-debs），再只追加附件不改写 body。
+          # 并行矩阵任务同时重建时可能撞 422 already_exists，失败后重查一次即可
+          ensure-release() {
+            gh release view "$1" >/dev/null 2>&1 && return 0
+            echo "Release $1 missing, re-creating from .github/release-body.md ..."
+            gh release create "$1" \
+              --title "${{ needs.prepare.outputs.release_name }}" \
+              --notes-file .github/release-body.md \
+              --target "$GITHUB_SHA" && return 0
+            gh release view "$1" >/dev/null 2>&1
+          }
+          ensure-release "${{ needs.prepare.outputs.release_tag }}"
           shopt -s nullglob
           files=(*.img.xz *.img *.sha)
           [[ ${#files[@]} -gt 0 ]] || { echo "No image files to upload"; exit 1; }
