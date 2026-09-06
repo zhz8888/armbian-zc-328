@@ -3,8 +3,11 @@ name: CI
 # 手动触发：构建 Armbian ZC-328 镜像。
 # 当前适配 Armbian tag：v26.11.0-trunk.30。
 # 编译产物以 release 形式发布：build-debs 构建的板级 deb + 各系统/类型变体的压缩镜像。
-# 矩阵风格参考 armbian-onecloud：多系统（RELEASE）× 多类型（minimal/cli/xfce 桌面）并行构建，
-# 各任务把自身产物与 sha256 追加到同一 release（append_body，prepare 预先建好 release）。
+# 矩阵风格参考 armbian-onecloud：多系统（RELEASE）× 多类型（minimal/cli/xfce 桌面）并行构建。
+# release 流程：prepare 用 gh 预先创建 release（body 仅纯描述信息，只写这一次），
+# build-debs / 各镜像任务用 `gh release upload --clobber` 只追加附件，不改写 body。
+# 不用 softprops：其 v3 先建草稿再发布，其他任务按 tag 查不到草稿会另建新 release，
+# 且其重复草稿清理逻辑会删掉带正文的那个 release，导致描述信息丢失。
 # release 名称格式：CI <armbian tag> <编译日期(UTC+0, 触发时刻)>
 on:
   workflow_dispatch:
@@ -28,8 +31,8 @@ env:
 
 jobs:
   # ---------------------------------------------------------------------------
-  # prepare: 按触发时刻 UTC 生成 release 名并预先创建 release（静态说明 + SHA256 空节，
-  #          后续 build-debs / 各镜像矩阵任务只追加附件与校验和，不再覆盖 body）
+  # prepare: 按触发时刻 UTC 生成 release 名，并立即创建 release（非草稿）。
+  #          body 只有纯描述信息；SHA256 与文件清单一律不再写入 release 正文。
   # ---------------------------------------------------------------------------
   prepare:
     name: Prepare
@@ -48,7 +51,7 @@ jobs:
           # release 显示名可含空格（用户格式要求）；git tag 不允许空格，故派生一个无空格的 tag
           echo "release_name=CI ${TAG} ${DATE}" >> "$GITHUB_OUTPUT"
           # 追加 run 序号保证每次触发 tag 唯一：同一天重复触发会复用同一日期，
-          # 若 tag 相同 softprops 会更新既有 release 并先删除同名旧资产，而刚上传的资产
+          # 若 tag 相同会更新既有 release 并先删除同名旧资产，而刚上传的资产
           # 在 GitHub API 里删除常返回 404（最终一致性），导致上传步骤失败。
           # 每次 run 用全新 tag => 总是创建新 release，不覆盖旧资产，彻底规避该问题。
           echo "release_tag=CI-${TAG}-${DATE}-r${{ github.run_number }}" >> "$GITHUB_OUTPUT"
@@ -56,39 +59,41 @@ jobs:
           echo "Release name: CI ${TAG} ${DATE}"
           echo "Release tag:  CI-${TAG}-${DATE}-r${{ github.run_number }}"
 
-      - name: Create release
+      # gh release create 默认立即发布（非草稿），后续任务按 tag 查找可靠
+      - name: Create release (description only)
         if: ${{ inputs.upload_release }}
-        uses: softprops/action-gh-release@v3
-        with:
-          tag_name: ${{ steps.release-name.outputs.release_tag }}
-          target_commitish: ${{ github.sha }}
-          name: ${{ steps.release-name.outputs.release_name }}
-          generate_release_notes: false
-          body: |
-            ## ZC-328 Armbian 镜像
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          cat > release-body.md <<'EOF'
+          ## ZC-328 Armbian 镜像
 
-            - **Armbian tag**: ${{ env.ARMBIAN_TAG }}
-            - **编译时间**: ${{ steps.release-name.outputs.release_date }}
-            - **Board**: ZC-328 (Rockchip RK3288)
-            - **Branch**: current
-            - **压缩**: xz（IMAGE_XZ_COMPRESSION_RATIO=9）
-            - **deb 软件包**: 板级内核 / DTB / headers 包已随本 release 附带（由 Build debs job 上传）
-            - **镜像变体**: 多系统 × 多类型（minimal / cli / xfce 桌面），清单见下方 SHA256 与附件
+          - **Armbian tag**: ${{ env.ARMBIAN_TAG }}
+          - **编译时间**: ${{ steps.release-name.outputs.release_date }}
+          - **Board**: ZC-328 (Rockchip RK3288)
+          - **Branch**: current
+          - **压缩**: xz（IMAGE_XZ_COMPRESSION_RATIO=9）
+          - **系统变体**: noble / resolute / bookworm / trixie × minimal / cli / xfce 桌面
+          - **deb 软件包**: 板级内核 / DTB / headers 包已随本 release 附带
 
-            ## 默认登录账号
+          ## 默认登录账号
 
-            Armbian 镜像默认凭据：
+          Armbian 镜像默认凭据：
 
-            - **用户名**: root
-            - **密码**: 1234
+          - **用户名**: root
+          - **密码**: 1234
 
-            > 首次登录会强制要求设置新密码。建议同时创建普通用户并 apt-mark hold 板级内核/U-Boot 包，避免升级被普通源覆盖（详见仓库 README）。
-
-            ## SHA256
+          > 首次登录会强制要求设置新密码。建议同时创建普通用户并 apt-mark hold 板级内核/U-Boot 包，避免升级被普通源覆盖（详见仓库 README）。
+          EOF
+          gh release create "${{ steps.release-name.outputs.release_tag }}" \
+            --title "${{ steps.release-name.outputs.release_name }}" \
+            --notes-file release-body.md \
+            --target "$GITHUB_SHA"
 
   # ---------------------------------------------------------------------------
   # build-debs: 构建板级 kernel/DTB/headers debs（与目标系统无关，供所有镜像变体复用），
-  #             并作为附件挂到 prepare 创建的 release 上
+  #             并作为附件追加到 prepare 创建的 release 上（不改写 body）
   # ---------------------------------------------------------------------------
   build-debs:
     name: Build debs current
@@ -152,30 +157,26 @@ jobs:
             armbian/output/debs/**/*.deb
           if-no-files-found: error
 
-      - name: Stage debs for release
-        if: ${{ inputs.upload_release }}
-        run: |
-          set -euo pipefail
-          mkdir -p armbian/output/debs-release
-          # 展平到单一目录，仅用一个不含 ** 的通配符上传，避免同名资产重复上传触发 404
-          find armbian/output/debs -name '*.deb' -exec cp {} armbian/output/debs-release/ \;
-          ls -la armbian/output/debs-release/
-
-      # release 已由 prepare 创建，本步骤只追加 deb 附件（不改动 body）
       - name: Upload debs to release
         if: ${{ inputs.upload_release }}
-        uses: softprops/action-gh-release@v3
-        with:
-          tag_name: ${{ needs.prepare.outputs.release_tag }}
-          files: armbian/output/debs-release/*.deb
-          fail_on_unmatched_files: true
-          generate_release_notes: false
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          # 展平到单一目录再上传，避免 *.deb 与 **/*.deb 通配符重叠导致同名资产重复上传
+          mkdir -p armbian/output/debs-release
+          find armbian/output/debs -name '*.deb' -exec cp {} armbian/output/debs-release/ \;
+          shopt -s nullglob
+          debs=(armbian/output/debs-release/*.deb)
+          [[ ${#debs[@]} -gt 0 ]] || { echo "No debs to upload"; exit 1; }
+          # 只追加附件，不改写 release body
+          gh release upload "${{ needs.prepare.outputs.release_tag }}" --clobber "${debs[@]}"
 
   # ---------------------------------------------------------------------------
   # build: 镜像矩阵（RELEASE × TYPE），参考 armbian-onecloud：
   #   minimal => BUILD_MINIMAL=yes；cli => 两者皆 no；desktop => BUILD_DESKTOP=yes + xfce
   # 各变体镜像文件名天然不同（armbian 会在文件名附加 _minimal / _<桌面环境>），
-  # 并行构建，互不干扰；各自把镜像 + sha256 追加到 release。
+  # 并行构建，互不干扰；各自把镜像 + 校验和作为附件追加到 release（不改写 body）。
   # ---------------------------------------------------------------------------
   build:
     name: Build ${{ matrix.RELEASE }}-${{ matrix.TYPE == 'desktop' && matrix.DESKTOP_ENVIRONMENT || matrix.TYPE }}
@@ -205,8 +206,6 @@ jobs:
         include:
           - TYPE: desktop
             DESKTOP_ENVIRONMENT: xfce
-            DESKTOP_ENVIRONMENT_CONFIG_NAME: config_base
-            DESKTOP_APPGROUPS_SELECTED: ""
 
     steps:
       - name: Checkout this repo (board patches)
@@ -258,7 +257,10 @@ jobs:
           cd "$GITHUB_WORKSPACE/armbian"
           # 用 'build' 而非 'docker' 子命令：armbian-next 在 GitHub runner 上会自动
           # 检测 Docker 并容器化构建；显式 'docker' 子命令在容器内会报 "asking for docker inside docker"。
-          # minimal/cli/desktop 由矩阵 TYPE 决定；desktop 额外传 xfce 相关参数。
+          # DESKTOP_TIER：armbian v26.11 起桌面软件包按档位选择（minimal/mid/full），
+          # 不传会在 CI 中弹交互式 "Choose desktop tier" 对话框导致构建失败
+          # （mid = 浏览器/文件管理器/媒体应用 ~1GB，即框架默认档位）；
+          # 旧的 DESKTOP_ENVIRONMENT_CONFIG_NAME / DESKTOP_APPGROUPS_SELECTED 已废弃。
           GITHUB_ACTIONS=false ./compile.sh build \
             BOARD=zc-328 \
             BRANCH=current \
@@ -266,8 +268,7 @@ jobs:
             BUILD_MINIMAL=${{ matrix.TYPE == 'minimal' && 'yes' || 'no' }} \
             BUILD_DESKTOP=${{ matrix.TYPE == 'desktop' && 'yes' || 'no' }} \
             DESKTOP_ENVIRONMENT=${{ matrix.DESKTOP_ENVIRONMENT }} \
-            DESKTOP_ENVIRONMENT_CONFIG_NAME=${{ matrix.DESKTOP_ENVIRONMENT_CONFIG_NAME }} \
-            DESKTOP_APPGROUPS_SELECTED=${{ matrix.DESKTOP_APPGROUPS_SELECTED }} \
+            DESKTOP_TIER=mid \
             KERNEL_CONFIGURE=no \
             KERNEL_GIT=shallow \
             EXPERT=yes \
@@ -292,31 +293,16 @@ jobs:
           name: image-${{ matrix.RELEASE }}-${{ matrix.TYPE == 'desktop' && matrix.DESKTOP_ENVIRONMENT || matrix.TYPE }}
           path: armbian/output/images/*
 
-      - name: Generate release addendum (sha256 lines)
+      - name: Upload to release
+        if: ${{ inputs.upload_release }}
+        env:
+          GH_TOKEN: ${{ github.token }}
         run: |
           set -euo pipefail
           cd "$GITHUB_WORKSPACE/armbian/output/images"
-          # armbian 在 COMPRESS_OUTPUTIMAGE=xz,sha 时生成 <镜像>.img.xz.sha（内容: <hash> <文件名>）；
-          # 旧工作流用 *.sha256* 通配符匹配不到该文件，release 里因此一直没有校验和文件
-          if ls *.img.xz.sha >/dev/null 2>&1; then
-            awk '{printf "%s: `%s`\n", $2, $1}' *.img.xz.sha > "$GITHUB_WORKSPACE/release-addendum.md"
-          else
-            sha256sum *.img.xz | awk '{printf "%s: `%s`\n", $2, $1}' > "$GITHUB_WORKSPACE/release-addendum.md"
-          fi
-          cat "$GITHUB_WORKSPACE/release-addendum.md"
-
-      - name: Upload to release
-        if: ${{ inputs.upload_release }}
-        uses: softprops/action-gh-release@v3
-        with:
-          tag_name: ${{ needs.prepare.outputs.release_tag }}
-          # 各矩阵任务并行把自己的 sha256 行追加到 release 末尾（body 由 prepare 预置）
-          append_body: true
-          body_path: release-addendum.md
-          # 镜像 + 校验和；armbian 生成的是 <镜像>.img.xz.sha，须用 *.sha 才能匹配到
-          files: |
-            armbian/output/images/*.img.xz
-            armbian/output/images/*.img
-            armbian/output/images/*.sha
-          fail_on_unmatched_files: false
-          generate_release_notes: false
+          # 镜像 + 校验和；armbian 生成的是 <镜像>.img.xz.sha，须包含 *.sha 才能匹配到。
+          # 只追加附件，不改写 release body（正文由 prepare 写好，保持纯描述信息）
+          shopt -s nullglob
+          files=(*.img.xz *.img *.sha)
+          [[ ${#files[@]} -gt 0 ]] || { echo "No image files to upload"; exit 1; }
+          gh release upload "${{ needs.prepare.outputs.release_tag }}" --clobber "${files[@]}"
